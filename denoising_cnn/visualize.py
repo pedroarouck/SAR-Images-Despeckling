@@ -19,21 +19,22 @@ def plot_results(original, noisy, denoised, title_prefix="", figsize=(10,4)):
 
 def plot_comparison(images_dict, figsize=(12, 8)):
     """
-        images_dict deve ser:
-    {'baseline': (orig_b, noisy_b, den_b),
-    'stochastic': (orig_s, noisy_s, den_s)}
-    Cada imagem é array 2D.
+    Mostra, em duas linhas, as tríades (Original, Noisy, Denoised)
+    para cada método (baseline, stochastic), incluindo o nome do modo
+    em cada título de subplot.
     """
-    modes = list(images_dict.keys())  # ['baseline','stochastic']
-    fig, axes = plt.subplots(2, 3, figsize=figsize)
+    modes = list(images_dict.keys())  # ex: ['baseline','stochastic']
+    labels = ['Original', 'Noisy', 'Denoised']
+    fig, axes = plt.subplots(len(modes), 3, figsize=figsize)
+
     for i, mode in enumerate(modes):
         orig, noisy, denoised = images_dict[mode]
         for j, img in enumerate([orig, noisy, denoised]):
             ax = axes[i, j]
             ax.imshow(img, cmap='gray')
-            if i == 0:
-                ax.set_title(['Original', 'Noisy', 'Denoised'][j])
-            ax.set_ylabel(mode if j == 0 else "")
+            # título explicando método + etapa
+            ax.set_title(f"{mode.capitalize()} — {labels[j]}")
             ax.axis('off')
+
     plt.tight_layout()
     plt.show()

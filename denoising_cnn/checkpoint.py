@@ -1,5 +1,3 @@
-# checkpoint.py
-
 import os
 import torch
 

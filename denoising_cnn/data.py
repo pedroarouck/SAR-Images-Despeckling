@@ -1,89 +1,73 @@
-import os
-import cv2
-import numpy as np
 import torch
-from torch.utils.data import Dataset
-from torchvision import transforms
+import torchvision.transforms.functional as F
+from torchgeo.datasets import RESISC45
 
-def load_images_from_folder(folder):
+def add_speckle_noise(img: torch.Tensor, L: float) -> torch.Tensor:
     """
-    Carrega imagens em escala de cinza de uma pasta e valida erros durante o processo.
-    """
-    images = []
-    if not os.path.exists(folder):
-        raise FileNotFoundError(f"A pasta '{folder}' não existe.")
-    if not os.path.isdir(folder):
-        raise NotADirectoryError(f"O caminho '{folder}' não é uma pasta válida.")
-    for filename in os.listdir(folder):
-        filepath = os.path.join(folder, filename)
-        if not os.path.isfile(filepath):
-            continue
-        if not filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff')):
-            continue
-        img = cv2.imread(filepath, cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            continue
-        images.append(img)
-    if not images:
-        raise ValueError("Nenhuma imagem válida foi carregada.")
-    return images
-
-def add_speckle_noise(image, L=1):
-    """
-    Adiciona ruído speckle à imagem usando a distribuição Gamma.
+    Adiciona ruído speckle multiplicativo uniforme a um tensor de imagem.
+    
+    Parâmetros
+    ----------
+    img : torch.Tensor
+        Tensor de imagem em escala de cinza, shape (1, H, W), valores em [0,1].
+    L : float
+        Número de looks; a variância do speckle será v = 1/L.
+    
+    Retorna
+    -------
+    torch.Tensor
+        Tensor ruidoso, mesmo shape, valores em [0,1].
     """
     if L < 1:
-        raise ValueError("O número de looks (L) deve ser >=1.")
-    row, col = image.shape
-    gamma_noise = np.random.gamma(L, 1.0 / L, (row, col))
-    return image * gamma_noise
+        raise ValueError("O número de looks (L) deve ser >= 1.")
+    v = 1.0 / L
+    a = (3 * v) ** 0.5
+    noise = torch.empty_like(img).uniform_(-a, a)
+    noisy = (img + img * noise).clamp(0.0, 1.0)
+    return noisy
 
-class ImageDataset(Dataset):
+class SARPairDataset(RESISC45):
     """
-    Dataset de pares (ruidosa, limpa), opcionalmente com augmentations.
+    Dataset que carrega RESISC45 via TorchGeo e devolve pares
+    (noisy, clean), gerando speckle on-the-fly com a função add_speckle_noise.
     """
-    def __init__(self, noisy_images, clean_images, apply_augmentations=False):
-        if len(noisy_images) != len(clean_images):
-            raise ValueError("Tamanhos diferentes em noisy_images e clean_images.")
-        self.noisy_images = noisy_images
-        self.clean_images = clean_images
-        self.transform = None
-        if apply_augmentations:
-            self.transform = transforms.Compose([
-                transforms.RandomHorizontalFlip(),
-                transforms.RandomVerticalFlip(),
-                transforms.RandomRotation(20),
-            ])
+
+    def __init__(
+        self,
+        root: str,
+        split: str,
+        L: float = 8.0,
+        download: bool = True,
+        checksum: bool = True,
+        transforms=None,
+    ):
+        super().__init__(
+            root=root,
+            split=split,
+            download=download,
+            checksum=checksum,
+            transforms=transforms,
+        )
+        self.L = L
+
+    def __getitem__(self, index):
+        # 1) pega o dicionário retornado pelo RESISC45
+        sample = super().__getitem__(index)
+        img_uint8 = sample["image"]    # Tensor em [0,255], shape (C,H,W)
+        # label = sample["label"]      # se você precisar do rótulo
+
+        # 2) converter para float em [0,1]
+        img = img_uint8.float().div(255.0)
+
+        # 3) RGB → grayscale se necessário
+        if img.shape[0] == 3:
+            img = F.rgb_to_grayscale(img)  # shape (1,H,W)
+
+        # 4) gerar o speckle via função separada
+        clean = img
+        noisy = add_speckle_noise(clean, self.L)
+
+        return noisy, clean
 
     def __len__(self):
-        return len(self.noisy_images)
-
-    def __getitem__(self, idx):
-        noisy = self.noisy_images[idx]
-        clean = self.clean_images[idx]
-        if self.transform:
-            noisy = self._apply_transform(noisy)
-            clean = self._apply_transform(clean)
-        # Converter para tensores com shape (1, H, W)
-        noisy_arr = np.asarray(noisy)
-        clean_arr = np.asarray(clean)
-
-        # Se veio com shape (H, W, 1), retire o último eixo
-        if noisy_arr.ndim == 3 and noisy_arr.shape[2] == 1:
-            noisy_arr = noisy_arr[:, :, 0]
-        if clean_arr.ndim == 3 and clean_arr.shape[2] == 1:
-             clean_arr = clean_arr[:, :, 0]
- 
-        # Agora (H, W) → tensor (1, H, W)
-        noisy_t = torch.from_numpy(noisy_arr).float().unsqueeze(0)
-        clean_t = torch.from_numpy(clean_arr).float().unsqueeze(0)
-        return noisy_t, clean_t
-
-
-    def _apply_transform(self, image):
-        image_pil = transforms.ToPILImage()(image)
-        aug_t = self.transform(image_pil)
-        # transforms.ToTensor() → tensor shape (C, H, W); em grayscale C=1
-        arr = transforms.ToTensor()(aug_t)
-        # volta para numpy (H, W)
-        return arr.squeeze(0).numpy()
+        return super().__len__()

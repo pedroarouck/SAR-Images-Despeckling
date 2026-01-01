@@ -3,36 +3,40 @@ import os
 import random
 
 # ─── 2) terceiros ──────────────────────────────────────────────────────────────
-import cv2
-import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import Adam
 from torch.cuda.amp import GradScaler
-from torch.utils.data import DataLoader
-from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader, Subset
 
 # ─── 3) seus módulos ───────────────────────────────────────────────────────────
-from data       import load_images_from_folder, add_speckle_noise, ImageDataset
+from data       import SARPairDataset
 from model      import DenoisingCNN
 from loss       import CombinedLoss
 from train      import train_epoch, validate_epoch
 from checkpoint import save_checkpoint, load_checkpoint
-from eval       import evaluate_and_plot
-from eval import evaluate_metrics
+from eval       import evaluate_and_plot, evaluate_metrics
 from visualize  import plot_comparison
 
 # ─── 4) hiperparâmetros e configuração ─────────────────────────────────────────
 SEED            = 42
-DATA_DIR        = 'BSDS500-master/BSDS500/data/images/train'
-IMG_SIZE        = (128, 128)
-FRACTION        = 0.1        # usar 10% das imagens
-BATCH_SIZE      = 4
+BATCH_SIZE      = 5
 LR              = 1e-3
-NUM_EPOCHS      = 10
+NUM_EPOCHS      = 1
 NUM_WORKERS     = 4          # para DataLoader, se quiser parallelizar
+DATA_ROOT       = "data/RESISC45"
+L_LOOKS         = 5        # 1/5 = 0.2 de variância
+FRACTION        = 0.001       # usar 1% das amostras para teste rápido
 
-def run_experiment(name: str, LossFn, device, train_loader, val_loader, val_ds, sample_idx):
+def run_experiment(
+    name: str,
+    LossFn,
+    device,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    val_ds: SARPairDataset,
+    sample_idx: int
+):
     """
     Executa um experimento de denoising:
       - name: rótulo ('baseline' ou 'stochastic')
@@ -41,34 +45,28 @@ def run_experiment(name: str, LossFn, device, train_loader, val_loader, val_ds, 
     """
     print(f"\n>>> Iniciando experimento: {name}")
 
-    # --- Escolhe UM índice aleatório para TODOS os experimentos ---
-    # 2) Modelo, loss e otimizador
+    # 1) modelo, loss e otimizador
     model     = DenoisingCNN(in_channels=1).to(device)
-    if name == "baseline":
-        criterion = nn.MSELoss()
-    else:
-        criterion = CombinedLoss()
+    criterion = LossFn() if name != "baseline" else nn.MSELoss()
     optimizer = Adam(model.parameters(), lr=LR)
     scaler    = GradScaler() if device.type == "cuda" else None
 
-    # 2.1) Tentar carregar checkpoint
+    # 2) tentar carregar checkpoint
     ckpt_file = f"{name}_ckpt.pth"
     start_epoch = 0
     if os.path.exists(ckpt_file):
         print(f"Carregando checkpoint de '{ckpt_file}'…")
-        # só model precisa, mas passamos optimizer para restaurar state_dict
         start_epoch, cfg = load_checkpoint(ckpt_file, model, optimizer)
         print(f"Retomando da época {start_epoch+1}, lr={cfg['lr']}")
-   
-    # 3) Treino
+
+    # 3) loop de treino
     for epoch in range(start_epoch, NUM_EPOCHS):
         tr = train_epoch(model, train_loader, criterion, optimizer, scaler, device)
         vl = validate_epoch(model, val_loader,   criterion,              device)
         print(f"[{name}][{epoch+1}/{NUM_EPOCHS}] train={tr:.4f} val={vl:.4f}")
         save_checkpoint(model, optimizer, epoch, f"{name}_ckpt.pth")
 
-       # 4) Avaliação final usando sample_idx fixo
-    # extrai as mesmas imagens de val_ds
+    # 4) avaliação final (mesmo sample_idx em todos os experimentos)
     noisy_t, original_t = val_ds[sample_idx]
     noisy_b = noisy_t.unsqueeze(0).to(device)
 
@@ -81,37 +79,54 @@ def run_experiment(name: str, LossFn, device, train_loader, val_loader, val_ds, 
     denoised = denoised_b.squeeze().cpu().numpy()
 
     metrics = evaluate_metrics(model, val_ds, device, sample_idx=sample_idx)
-    # (você precisará adicionar esse parâmetro em evaluate_metrics também,
-    # mas se não quiser mexer lá, basta chamar a evaluate_metrics original
-    # para fins de métrica, e só usar sample_idx aqui para capturar imagens.)
-
     return metrics, (original, noisy, denoised)
 
 
 def main():
+    # fixar seed
+    torch.manual_seed(SEED)
+    random.seed(SEED)
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-# --- Prepara dados UMA ÚNICA VEZ ---
-    images = load_images_from_folder(DATA_DIR)
-    images = [cv2.resize(img, IMG_SIZE) for img in images]
-    images = images[: int(len(images) * FRACTION)]
-    noisy  = [add_speckle_noise(img, L=5) for img in images]
 
-    images = np.array(images) / 255.0
-    noisy  = np.array(noisy)  / 255.0
-    images = images[..., None]
-    noisy  = noisy[...,  None]
-
-    X_train, X_val, y_train, y_val = train_test_split(
-        noisy, images, test_size=0.2, random_state=SEED
+    # --- Prepara dados com RESISC45 on-the-fly ---
+    train_ds = SARPairDataset(
+        root=DATA_ROOT,
+        split="train",
+        download=False,
+        checksum=True,
+        L=L_LOOKS
     )
-    train_ds = ImageDataset(X_train, y_train)
-    val_ds   = ImageDataset(X_val,   y_val)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE,
-                              shuffle=True,  num_workers=NUM_WORKERS)
-    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE,
-                              shuffle=False, num_workers=NUM_WORKERS)
+    val_ds = SARPairDataset(
+        root=DATA_ROOT,
+        split="val",
+        download=False,
+        checksum=True,
+        L=L_LOOKS
+    )
+
+    # ─── Limita o tamanho para testes rápidos ────────────────────────────
+    num_train = int(len(train_ds) * FRACTION)
+    num_val   = int(len(val_ds)   * FRACTION)
+    train_ds = Subset(train_ds, list(range(num_train)))
+    val_ds   = Subset(val_ds,   list(range(num_val)))  
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS
+    )
+
+    # escolhe um sample fixo para plotagem após treino
     sample_idx = random.randint(0, len(val_ds) - 1)
-    # --------------------------------------
+
     experiments = [
         ("baseline", nn.MSELoss),
         ("stochastic", CombinedLoss),
@@ -120,13 +135,15 @@ def main():
     all_images  = {}
 
     for name, LossFn in experiments:
-        res, imgs = run_experiment(name, LossFn, device,
-                                train_loader, val_loader, val_ds,
-                                sample_idx)
+        res, imgs = run_experiment(
+            name, LossFn, device,
+            train_loader, val_loader, val_ds,
+            sample_idx
+        )
         all_results[name] = res
         all_images[name]  = imgs
 
-    # Avaliação e plotagem final
+    # exibe tabela de métricas
     print("\n=== Comparação de Métricas ===")
     header = "Métrica".ljust(25) + " | " + "Baseline".center(8) + " | " + "Stochastic".center(10)
     print(header)
@@ -136,8 +153,9 @@ def main():
         s = all_results["stochastic"][metric]
         print(f"{metric.ljust(25)} | {b:8.4f} | {s:10.4f}")
 
-    # 3) Plot comparativo final
+    # plot final comparativo
     plot_comparison(all_images)
+
 
 if __name__ == "__main__":
     main()
